@@ -7,8 +7,8 @@
     1. 再生回数（このアプリから再生した回数）を記録
     2. ジャンルごとの保存日数の制限（期限切れを削除候補に）
     3. ジャンル分け（授業 / 日常（プライベート） / 行事：体育祭・文化祭・校外学習）
-    4. 1つ1つの録画の容量を表示
-    5. ドライブの使用量が80%を超えたら警告
+    4. 1つ1つの録画の容量を表示（動画だけでなく画像も扱える）
+    5. 録画の合計が上限（20MB）の80%を超えたら警告
 
   必要なもの: Python 3.8 以上（tkinter は標準で入っています）
   あると便利 : pip install send2trash  （削除したファイルをゴミ箱に送れるようになる）
@@ -16,7 +16,6 @@
 import datetime
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tkinter as tk
@@ -30,8 +29,12 @@ except ImportError:
 # ------------------------------------------------------------------ 設定
 VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".m4v", ".mts",
              ".m2ts", ".3gp", ".webm", ".flv", ".mpg", ".mpeg"}
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic",
+             ".heif", ".tif", ".tiff"}
+MEDIA_EXT = VIDEO_EXT | IMAGE_EXT        # 一覧に表示するファイル
 DATA_FILE = ".rokuga_kanri.json"        # 再生回数やジャンルを保存するファイル
-WARN_RATIO = 0.80                       # 80%で警告
+MAX_BYTES = 20 * 1024 ** 2               # 録画の合計の上限（20MB）
+WARN_RATIO = 0.80                       # 上限の80%で警告
 
 GENRES = ["未分類", "授業", "日常（プライベート）",
           "行事：体育祭", "行事：文化祭", "行事：校外学習", "行事：その他"]
@@ -131,10 +134,14 @@ class App(tk.Tk):
         self.geometry("1250x680")
         self.minsize(900, 500)
         self.folder = None
-        self.data = {"files": {}, "limits": dict(DEFAULT_LIMITS)}
-        self.items = {}            # 相対パス -> 表示用情報
+        self.data = {"files": {}, "limits": dict(DEFAULT_LIMITS), "extra": []}
+        self.items = {}            # 相対パス（追加したファイルはフルパス） -> 表示用情報
         self.sort_col, self.sort_rev = "score", True
         self._build_ui()
+        # フォルダを選ぶ前でも、前回「ファイルを追加」した録画を表示する
+        self.load_data()
+        if self.data["extra"]:
+            self.after(100, self.scan)
 
     # ---------------- UI
     def _build_ui(self):
@@ -151,6 +158,7 @@ class App(tk.Tk):
         top = ttk.Frame(self, padding=8)
         top.pack(fill="x")
         ttk.Button(top, text="📁 録画フォルダを選ぶ", command=self.choose_folder).pack(side="left")
+        ttk.Button(top, text="➕ ファイルを追加", command=self.add_files).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="🔄 再読み込み", command=self.scan).pack(side="left", padx=6)
         self.folder_label = ttk.Label(top, text="フォルダが選ばれていません")
         self.folder_label.pack(side="left", padx=8)
@@ -158,7 +166,7 @@ class App(tk.Tk):
         # 容量バー
         cap = ttk.Frame(self, padding=(8, 0))
         cap.pack(fill="x")
-        ttk.Label(cap, text="ドライブ使用量:").pack(side="left")
+        ttk.Label(cap, text=f"録画の合計（上限{human_size(MAX_BYTES)}）:").pack(side="left")
         self.cap_bar = ttk.Progressbar(cap, length=350, maximum=100,
                                        style="Ok.Horizontal.TProgressbar")
         self.cap_bar.pack(side="left", padx=6)
@@ -220,20 +228,22 @@ class App(tk.Tk):
 
     # ---------------- データ保存
     def data_path(self):
-        return os.path.join(self.folder, DATA_FILE)
+        # フォルダを選んでいないときは、ホームフォルダに記録する
+        return os.path.join(self.folder or os.path.expanduser("~"), DATA_FILE)
 
     def load_data(self):
-        self.data = {"files": {}, "limits": dict(DEFAULT_LIMITS)}
+        self.data = {"files": {}, "limits": dict(DEFAULT_LIMITS), "extra": []}
         try:
             with open(self.data_path(), encoding="utf-8") as f:
                 loaded = json.load(f)
             self.data["files"] = loaded.get("files", {})
             self.data["limits"].update(loaded.get("limits", {}))
+            self.data["extra"] = loaded.get("extra", [])
         except (OSError, ValueError):
             pass
 
     def save_data(self):
-        if not self.folder:
+        if not self.folder and not self.data["extra"] and not os.path.exists(self.data_path()):
             return
         try:
             with open(self.data_path(), "w", encoding="utf-8") as f:
@@ -250,29 +260,70 @@ class App(tk.Tk):
             self.load_data()
             self.scan()
 
-    def scan(self):
+    def add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="追加する録画・画像を選んでください",
+            filetypes=[("動画・画像", " ".join("*" + e for e in sorted(MEDIA_EXT))),
+                       ("動画ファイル", " ".join("*" + e for e in sorted(VIDEO_EXT))),
+                       ("画像ファイル", " ".join("*" + e for e in sorted(IMAGE_EXT))),
+                       ("すべてのファイル", "*.*")])
+        if not paths:
+            return
+        known = {os.path.normcase(p) for p in self.data["extra"]}
+        skipped = []
+        for p in paths:
+            p = os.path.normpath(p)
+            if os.path.splitext(p)[1].lower() not in MEDIA_EXT:
+                skipped.append(os.path.basename(p))
+            elif self.in_folder(p) or os.path.normcase(p) in known:
+                continue           # すでに一覧に入っている
+            else:
+                self.data["extra"].append(p)
+                known.add(os.path.normcase(p))
+        if skipped:
+            messagebox.showinfo("お知らせ", "動画・画像ではないので追加しませんでした。\n\n" + "\n".join(skipped))
+        self.scan()
+
+    def in_folder(self, path):
         if not self.folder:
+            return False
+        try:
+            return os.path.commonpath([os.path.abspath(self.folder), path]) == os.path.abspath(self.folder)
+        except ValueError:     # ドライブが違う
+            return False
+
+    def scan(self):
+        if not self.folder and not self.data["extra"]:
             return
         self.items.clear()
         today = datetime.date.today()
-        for root, _dirs, names in os.walk(self.folder):
-            for name in names:
-                if os.path.splitext(name)[1].lower() not in VIDEO_EXT:
-                    continue
-                full = os.path.join(root, name)
-                rel = os.path.relpath(full, self.folder)
-                try:
-                    st = os.stat(full)
-                except OSError:
-                    continue
-                meta = self.data["files"].setdefault(rel, {
-                    "genre": guess_genre(rel), "opens": 0,
-                    "last_opened": None, "protect": False})
-                date = datetime.date.fromtimestamp(st.st_mtime)
-                self.items[rel] = {"rel": rel, "full": full, "size": st.st_size,
-                                   "date": date, "age": (today - date).days,
-                                   "genre": meta["genre"], "opens": meta["opens"],
-                                   "protect": meta.get("protect", False)}
+
+        def add_item(key, full):
+            try:
+                st = os.stat(full)
+            except OSError:
+                return
+            meta = self.data["files"].setdefault(key, {
+                "genre": guess_genre(key), "opens": 0,
+                "last_opened": None, "protect": False})
+            date = datetime.date.fromtimestamp(st.st_mtime)
+            self.items[key] = {"rel": key, "full": full, "size": st.st_size,
+                               "date": date, "age": (today - date).days,
+                               "genre": meta["genre"], "opens": meta["opens"],
+                               "protect": meta.get("protect", False)}
+
+        if self.folder:
+            for root, _dirs, names in os.walk(self.folder):
+                for name in names:
+                    if os.path.splitext(name)[1].lower() not in MEDIA_EXT:
+                        continue
+                    full = os.path.join(root, name)
+                    add_item(os.path.relpath(full, self.folder), full)
+        # 「ファイルを追加」した録画はフルパスで管理する
+        for full in self.data["extra"]:
+            if not self.in_folder(full):
+                add_item(full, full)
+        self.data["extra"] = [p for p in self.data["extra"] if p in self.items]
         # 消えたファイルの記録は掃除
         for rel in list(self.data["files"]):
             if rel not in self.items:
@@ -337,13 +388,13 @@ class App(tk.Tk):
             self.sel_label.config(text="")
 
     def update_capacity(self, show_popup=False):
-        if not self.folder:
+        if not self.folder and not self.data["extra"]:
             return
-        usage = shutil.disk_usage(self.folder)
-        ratio = usage.used / usage.total
-        self.cap_bar["value"] = ratio * 100
-        self.cap_label.config(text=f"{ratio * 100:.1f}%（{human_size(usage.used)} / "
-                                   f"{human_size(usage.total)}、空き {human_size(usage.free)}）")
+        used = sum(i["size"] for i in self.items.values())
+        ratio = used / MAX_BYTES
+        self.cap_bar["value"] = min(100, ratio * 100)
+        self.cap_label.config(text=f"{ratio * 100:.1f}%（{human_size(used)} / "
+                                   f"{human_size(MAX_BYTES)}、残り {human_size(max(0, MAX_BYTES - used))}）")
         if ratio >= WARN_RATIO:
             self.cap_bar.config(style="Warn.Horizontal.TProgressbar")
             self.warn_label.config(text="⚠ 容量が80%を超えています！")
@@ -351,7 +402,7 @@ class App(tk.Tk):
                 cand = [i for i in self.items.values() if i["score"] >= 60]
                 messagebox.showwarning(
                     "容量の警告",
-                    f"ドライブの使用量が {ratio * 100:.1f}% です（80%超え）。\n\n"
+                    f"録画の合計が上限 {human_size(MAX_BYTES)} の {ratio * 100:.1f}% です（80%超え）。\n\n"
                     f"「◎ 消してOK」の録画が {len(cand)}本あります。\n"
                     f"全部消すと約 {human_size(sum(i['size'] for i in cand))} 空きます。")
         else:
@@ -424,6 +475,8 @@ class App(tk.Tk):
                 else:
                     os.remove(self.items[rel]["full"])
                 self.data["files"].pop(rel, None)
+                if rel in self.data["extra"]:
+                    self.data["extra"].remove(rel)
                 self.items.pop(rel, None)
             except OSError as e:
                 errors.append(f"{rel}: {e}")
